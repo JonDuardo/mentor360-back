@@ -74,12 +74,15 @@ const groupsConflict = (a, b) => {
   const ga = familyGroup(a);
   const gb = familyGroup(b);
   if (ga === gb) return false;
+
   // conjugal nunca deve mesclar com irmãos/parental sem evidência forte (nome completo)
   const conflictPairs = new Set([
-    "conjugal|irmao","irmao|conjugal",
-    "conjugal|parental","parental|conjugal",
+    "conjugal|irmao", "irmao|conjugal",
+    "conjugal|parental", "parental|conjugal",
   ]);
-  return conflictPairs.has(`${ga}|${gb}`);
+
+  const key = ga + "|" + gb; // evita template literal
+  return conflictPairs.has(key);
 };
 
 
