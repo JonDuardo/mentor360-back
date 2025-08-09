@@ -8,6 +8,297 @@ const { taggearMensagem } = require('./tagger-utils'); // Tagging
 const { buscarConteudoBasePorTags } = require('./conteudo_utils'); // Conteúdo autoral Alan
 
 const app = express();
+
+
+// ====== [VÍNCULOS DINÂMICOS] Extração + deduplicação + upsert =================
+
+const OPENAI_EXTRACT_MODEL = "gpt-4o-mini";
+
+// normaliza strings para comparação (minúsculas, sem acentos, trim)
+const normalize = (s = "") =>
+  s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+
+// une arrays removendo duplicadas (case-insensitive)
+const uniqMerge = (a = [], b = []) => {
+  const seen = new Set((a || []).map((x) => normalize(x)));
+  const out = [...(a || [])];
+  (b || []).forEach((x) => {
+    if (!seen.has(normalize(x))) out.push(x);
+  });
+  return out;
+};
+
+// vínculos considerados "exclusivos" (só pode existir 1 por usuário)
+const VINCULO_EXCLUSIVO = new Set(["esposa", "esposo", "cônjuge", "conjuge", "marido"]);
+
+// extrai pessoas citadas com ajuda do LLM (nome, apelidos, vínculo)
+async function extrairPessoasDaMensagem(texto) {
+  const sys = `Extraia pessoas citadas da mensagem. Responda EXATAMENTE este JSON:
+[
+  {
+    "nome_real": "string | ou vazio se não souber",
+    "apelidos": ["array de apelidos ou variações"],
+    "tipo_vinculo": "pai|mae|mãe|irmao|irma|filho|filha|esposa|esposo|conjuge|namorada|namorado|eu mesmo|amigo|colega|desconhecido",
+    "observacao": "curto contexto se útil (opcional)"
+  }
+]
+- Não invente nomes; preserve apelidos como foram ditos (ex.: "Lu Braga", "JEA", "Paulinho").
+- Se a mensagem mencionar "meu marido/minha esposa" sem nome, retorne tipo_vinculo correto e apelido vazio.
+- Se a pessoa for o próprio usuário (ex.: "eu mesmo"), use tipo_vinculo "eu mesmo".`;
+
+  const userMsg = `Mensagem: """${texto}"""`;
+
+  const r = await openai.chat.completions.create({
+    model: OPENAI_EXTRACT_MODEL,
+    temperature: 0,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: userMsg },
+    ],
+    max_tokens: 300,
+  });
+
+  let raw = r.choices?.[0]?.message?.content?.trim() || "[]";
+  // remove ```json ... ```
+  raw = raw.replace(/^```json\s*/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+  } catch (_) {}
+  return [];
+}
+
+// busca todos os vínculos já existentes do usuário (uma vez por mensagem)
+async function fetchVinculosExistentes(user_id) {
+  const { data, error } = await supabase
+    .from("vinculos_usuario")
+    .select("*")
+    .eq("user_id", user_id);
+
+  if (error) {
+    console.error("Erro ao buscar vínculos existentes:", error);
+    return [];
+  }
+  return data || [];
+}
+
+// encontra um vínculo existente por (alias match) ou por nome normalizado
+function encontrarMatchVinculo(existing = [], { nome_real, apelidos = [], tipo_vinculo }) {
+  const nomeN = normalize(nome_real || "");
+  const aliasesN = (apelidos || []).map(normalize);
+
+  // 1) match por alias
+  for (const v of existing) {
+    const aliasesExist = (v.apelidos_descricoes || []).map(normalize);
+    // se qualquer alias bate com os que chegaram
+    if (aliasesN.some((a) => aliasesExist.includes(a))) return v;
+  }
+
+  // 2) match por nome_real (quando fornecido)
+  if (nomeN) {
+    for (const v of existing) {
+      if (normalize(v.nome_real || "") === nomeN) return v;
+    }
+  }
+
+  // 3) regra de vínculo exclusivo (cônjuge, etc.)
+  if (tipo_vinculo && VINCULO_EXCLUSIVO.has(normalize(tipo_vinculo))) {
+    for (const v of existing) {
+      if (VINCULO_EXCLUSIVO.has(normalize(v.tipo_vinculo || ""))) {
+        return v; // já existe “cônjuge” → trata como mesma pessoa
+      }
+    }
+  }
+
+  return null;
+}
+
+// upsert de um único vínculo (fundindo alias, frequência, histórico, última menção)
+async function upsertVinculo(user_id, pessoa, agoraISO, trechoMensagem = "") {
+  const existentes = await fetchVinculosExistentes(user_id);
+  const match = encontrarMatchVinculo(existentes, pessoa);
+
+  const novoHistoricoItem = {
+    data: agoraISO,
+    trecho: (trechoMensagem || "").slice(0, 240),
+  };
+
+  if (match) {
+    // merge
+    const apelidosNew = uniqMerge(match.apelidos_descricoes || [], pessoa.apelidos || []);
+    const marcadorEmocional = match.marcador_emocional || []; // mantenha como está por enquanto
+    const contextosRelevantes = match.contextos_relevantes || [];
+
+    // nome_real: se não tinha, ou se o novo parece “melhor” (mais longo), atualiza
+    const nomeAtual = match.nome_real || "";
+    const nomeNovo = pessoa.nome_real || "";
+    const nomeFinal =
+      (!nomeAtual && nomeNovo) || (nomeNovo && nomeNovo.length > nomeAtual.length) ? nomeNovo : nomeAtual;
+
+    // histórico (limite 12)
+    const historico = Array.isArray(match.historico_mencoes) ? match.historico_mencoes : [];
+    const historicoNovo = [...historico, novoHistoricoItem].slice(-12);
+
+    const { error } = await supabase
+      .from("vinculos_usuario")
+      .update({
+        nome_real: nomeFinal || match.nome_real,
+        tipo_vinculo: pessoa.tipo_vinculo || match.tipo_vinculo,
+        apelidos_descricoes: apelidosNew,
+        marcador_emocional: marcadorEmocional,
+        contextos_relevantes: contextosRelevantes,
+        frequencia_mencao: (match.frequencia_mencao || 0) + 1,
+        ultima_mencao: agoraISO,
+        historico_mencoes: historicoNovo,
+      })
+      .eq("id", match.id);
+
+    if (error) console.error("Erro update vínculo:", error);
+    return match.id;
+  }
+
+  // insert novo
+  const toInsert = {
+    user_id,
+    nome_real: pessoa.nome_real || null,
+    tipo_vinculo: pessoa.tipo_vinculo || "desconhecido",
+    apelidos_descricoes: pessoa.apelidos || [],
+    marcador_emocional: [], // pode ser alimentado depois
+    contextos_relevantes: [],
+    frequencia_mencao: 1,
+    ultima_mencao: agoraISO,
+    historico_mencoes: [novoHistoricoItem],
+    perfil_compacto: null,
+  };
+
+  const { data, error } = await supabase
+    .from("vinculos_usuario")
+    .insert([toInsert])
+    .select("id")
+    .single();
+
+  if (error) {
+    console.error("Erro insert vínculo:", error);
+    return null;
+  }
+  return data?.id || null;
+}
+
+// gera/atualiza perfil_compacto (barato, mini) com base no que já sabemos
+async function atualizarPerfilCompacto(vinculoId) {
+  if (!vinculoId) return;
+
+  const { data: v, error } = await supabase
+    .from("vinculos_usuario")
+    .select("nome_real, tipo_vinculo, apelidos_descricoes, marcador_emocional, contextos_relevantes, perfil_compacto")
+    .eq("id", vinculoId)
+    .single();
+
+  if (error || !v) return;
+
+  // monta um texto curto como input
+  const base = `
+Nome: ${v.nome_real || "(não informado)"}
+Vínculo: ${v.tipo_vinculo || "-"}
+Apelidos: ${(v.apelidos_descricoes || []).join(", ") || "-"}
+Emoções-chave: ${(v.marcador_emocional || []).join(", ") || "-"}
+Contextos: ${(v.contextos_relevantes || []).join(", ") || "-"}
+`.trim();
+
+  const sys = `Resuma em 1-2 frases, úteis para personalizar respostas em um chat.
+Seja factual, curto e sem conselhos.`;
+  const r = await openai.chat.completions.create({
+    model: OPENAI_EXTRACT_MODEL,
+    temperature: 0.2,
+    max_tokens: 90,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: base },
+    ],
+  });
+  const resumo = r.choices?.[0]?.message?.content?.trim();
+  if (!resumo) return;
+
+  await supabase
+    .from("vinculos_usuario")
+    .update({ perfil_compacto: resumo })
+    .eq("id", vinculoId);
+}
+
+// === API para a rota /ia usar ===
+// processa uma mensagem inteira: extrai todas as pessoas, upserta, e retorna nomes/aliases citados
+async function processarVinculosUsuario(texto, user_id) {
+  const pessoas = await extrairPessoasDaMensagem(texto);
+  const agoraISO = new Date().toISOString();
+
+  const idsAtualizados = [];
+  const nomesOuApelidosCitados = [];
+
+  for (const p of pessoas) {
+    // garante campos básicos
+    p.apelidos = Array.isArray(p.apelidos) ? p.apelidos.filter(Boolean) : [];
+    if (p.nome_real) nomesOuApelidosCitados.push(p.nome_real);
+    nomesOuApelidosCitados.push(...p.apelidos);
+
+    // upsert com deduplicação (inclui regra de cônjuge exclusivo)
+    const id = await upsertVinculo(user_id, p, agoraISO, texto);
+    if (id) {
+      idsAtualizados.push(id);
+      // atualiza/gera perfil compacto (assíncrono, mas aguardamos para beta)
+      await atualizarPerfilCompacto(id);
+    }
+  }
+
+  return nomesOuApelidosCitados.filter(Boolean);
+}
+
+// seleciona vínculos p/ contexto (prioriza citados; senão top por frequência/recência)
+async function selecionarVinculosParaContexto(user_id, nomesCitados = [], limite = 3) {
+  const { data, error } = await supabase
+    .from("vinculos_usuario")
+    .select("id, nome_real, tipo_vinculo, apelidos_descricoes, perfil_compacto, frequencia_mencao, ultima_mencao")
+    .eq("user_id", user_id);
+
+  if (error || !data) return [];
+
+  const nomesN = nomesCitados.map(normalize);
+  const citados = [];
+  const outros = [];
+
+  for (const v of data) {
+    const nomeMatch = nomesN.includes(normalize(v.nome_real || ""));
+    const aliasMatch = (v.apelidos_descricoes || []).some((a) => nomesN.includes(normalize(a)));
+    if (nomeMatch || aliasMatch) citados.push(v);
+    else outros.push(v);
+  }
+
+  // ordena “outros” por frequência e recência
+  outros.sort((a, b) => {
+    const f = (b.frequencia_mencao || 0) - (a.frequencia_mencao || 0);
+    if (f !== 0) return f;
+    const da = new Date(a.ultima_mencao || 0).getTime();
+    const db = new Date(b.ultima_mencao || 0).getTime();
+    return db - da;
+  });
+
+  const selecionados = [...citados, ...outros].slice(0, limite);
+  return selecionados;
+}
+
+// monta bloco compacto de vínculos p/ colar no prompt
+function montarBlocoVinculos(vinculos = []) {
+  if (!vinculos.length) return "—";
+  return vinculos
+    .map((v) => {
+      const apelidos = (v.apelidos_descricoes || []).join(", ");
+      const perfil = v.perfil_compacto || "";
+      return `- ${v.nome_real || "(sem nome)"} — [${v.tipo_vinculo || "-"}]${apelidos ? ` | apelidos: ${apelidos}` : ""}${perfil ? `\n  Perfil: ${perfil}` : ""}`;
+    })
+    .join("\n");
+}
+
+
+
 app.use(cors());
 app.use(express.json());
 
