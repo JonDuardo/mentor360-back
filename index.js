@@ -41,6 +41,54 @@ async function extrairPessoasDaMensagem(texto) {
     "tipo_vinculo": "pai|mae|mãe|irmao|irma|filho|filha|esposa|esposo|conjuge|namorada|namorado|eu mesmo|amigo|colega|desconhecido",
     "observacao": "curto contexto se útil (opcional)"
   }
+
+
+
+
+
+
+
+
+// --- Helpers para desambiguação ---
+const isWeakAlias = (s = "") => {
+  const t = normalize(s);
+  // aliases de 1 palavra e com <= 3 letras são fracos (ex.: "Lu", "Jo", "Pa")
+  if (!t) return true;
+  const words = t.split(/\s+/);
+  if (words.length === 1 && t.length <= 3) return true;
+  return false;
+};
+
+// mapeia grupos de parentesco p/ evitar merges cruzados
+const familyGroup = (tipo = "") => {
+  const t = normalize(tipo);
+  if (["esposa","esposo","conjuge","cônjuge","marido","namorada","namorado","parceira","parceiro"].includes(t)) return "conjugal";
+  if (["irma","irmão","irmao","irmã"].includes(t)) return "irmao";
+  if (["mae","mãe","pai","sogra","sogro"].includes(t)) return "parental";
+  if (["filho","filha"].includes(t)) return "filhos";
+  return "outros";
+};
+
+// checa se dois tipos pertencem a grupos diferentes e “conflitantes”
+const groupsConflict = (a, b) => {
+  const ga = familyGroup(a);
+  const gb = familyGroup(b);
+  if (ga === gb) return false;
+  // conjugal nunca deve mesclar com irmãos/parental sem evidência forte (nome completo)
+  const conflictPairs = new Set([
+    "conjugal|irmao","irmao|conjugal",
+    "conjugal|parental","parental|conjugal",
+  ]);
+  return conflictPairs.has(`${ga}|${gb}`);
+};
+
+
+
+
+
+
+
+
 ]
 - Não invente nomes; preserve apelidos como foram ditos (ex.: "Lu Braga", "JEA", "Paulinho").
 - Se a mensagem mencionar "meu marido/minha esposa" sem nome, retorne tipo_vinculo correto e apelido vazio.
@@ -82,36 +130,72 @@ async function fetchVinculosExistentes(user_id) {
   return data || [];
 }
 
+
+
+
+
+
+
+
 // encontra um vínculo existente por (alias match) ou por nome normalizado
 function encontrarMatchVinculo(existing = [], { nome_real, apelidos = [], tipo_vinculo }) {
   const nomeN = normalize(nome_real || "");
   const aliasesN = (apelidos || []).map(normalize);
 
-  // 1) match por alias
+  let best = null;
+  let bestScore = -1;
+
   for (const v of existing) {
-    const aliasesExist = (v.apelidos_descricoes || []).map(normalize);
-    // se qualquer alias bate com os que chegaram
-    if (aliasesN.some((a) => aliasesExist.includes(a))) return v;
-  }
+    let score = 0;
 
-  // 2) match por nome_real (quando fornecido)
-  if (nomeN) {
-    for (const v of existing) {
-      if (normalize(v.nome_real || "") === nomeN) return v;
+    const vNome = normalize(v.nome_real || "");
+    const vAliases = (v.apelidos_descricoes || []).map(normalize);
+
+    // evidências fortes
+    if (nomeN && vNome && nomeN === vNome) score += 6;
+
+    // alias composto (>= 2 palavras) bate? forte
+    const composedAliasHit = aliasesN.some(a => a.includes(" ") && vAliases.includes(a));
+    if (composedAliasHit) score += 5;
+
+    // alias curto/fraco
+    const weakOverlap = aliasesN.some(a => !a.includes(" ") && vAliases.includes(a));
+    if (weakOverlap) {
+      // só conta se o tipo de vínculo não conflita
+      if (!groupsConflict(v.tipo_vinculo || "", tipo_vinculo || "")) score += 2;
+    }
+
+    // semelhança por tokens do nome (quando ambos têm nome)
+    if (nomeN && vNome && !score) {
+      const a = new Set(nomeN.split(/\s+/));
+      const b = new Set(vNome.split(/\s+/));
+      const inter = [...a].filter(x => b.has(x)).length;
+      const jacc = inter / Math.max(1, a.size + b.size - inter);
+      if (jacc >= 0.7) score += 4;
+    }
+
+    // se há conflito de grupos, exija evidência muito forte
+    const conflict = groupsConflict(v.tipo_vinculo || "", tipo_vinculo || "");
+    const strongEvidence = (nomeN && vNome && nomeN === vNome) || composedAliasHit;
+
+    if (conflict && !strongEvidence) continue; // não mescla
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = v;
     }
   }
 
-  // 3) regra de vínculo exclusivo (cônjuge, etc.)
-  if (tipo_vinculo && VINCULO_EXCLUSIVO.has(normalize(tipo_vinculo))) {
-    for (const v of existing) {
-      if (VINCULO_EXCLUSIVO.has(normalize(v.tipo_vinculo || ""))) {
-        return v; // já existe “cônjuge” → trata como mesma pessoa
-      }
-    }
-  }
-
-  return null;
+  // limiar mínimo p/ mesclar
+  // 5 = nome igual ou alias composto igual; 4 = similaridade alta
+  return bestScore >= 5 ? best : null;
 }
+
+
+
+
+
+
 
 // upsert de um único vínculo (fundindo alias, frequência, histórico, última menção)
 async function upsertVinculo(user_id, pessoa, agoraISO, trechoMensagem = "") {
@@ -229,12 +313,28 @@ Seja factual, curto e sem conselhos.`;
 // processa uma mensagem inteira: extrai todas as pessoas, upserta, e retorna nomes/aliases citados
 async function processarVinculosUsuario(texto, user_id) {
   const pessoas = await extrairPessoasDaMensagem(texto);
+
+
+
+
+
+
+const pessoasAjustadas = await inferirParentescoRelativo(texto, user_id, pessoas);
+
+
+
+
+
+
+
+
+
   const agoraISO = new Date().toISOString();
 
   const idsAtualizados = [];
   const nomesOuApelidosCitados = [];
 
-  for (const p of pessoas) {
+  for (const p of pessoasAjustadas) {
     // garante campos básicos
     p.apelidos = Array.isArray(p.apelidos) ? p.apelidos.filter(Boolean) : [];
     if (p.nome_real) nomesOuApelidosCitados.push(p.nome_real);
@@ -284,6 +384,68 @@ async function selecionarVinculosParaContexto(user_id, nomesCitados = [], limite
   const selecionados = [...citados, ...outros].slice(0, limite);
   return selecionados;
 }
+
+
+
+
+
+
+// retorna array de registros de cônjuge p/ o user
+async function getConjuges(user_id) {
+  const { data } = await supabase
+    .from("vinculos_usuario")
+    .select("id, nome_real, apelidos_descricoes, tipo_vinculo")
+    .eq("user_id", user_id);
+  const conj = (data || []).filter(v =>
+    ["esposa","esposo","conjuge","cônjuge","marido","namorada","namorado","parceira","parceiro"]
+      .includes(normalize(v.tipo_vinculo))
+  );
+  return conj;
+}
+
+function matchNomeOuAlias(v, alvo) {
+  const t = normalize(alvo);
+  if (!t) return false;
+  if (normalize(v.nome_real || "") === t) return true;
+  const aliases = (v.apelidos_descricoes || []).map(normalize);
+  return aliases.includes(t);
+}
+
+// “mãe/pai de <nome>” → sogra/sogro se <nome> = cônjuge
+async function inferirParentescoRelativo(texto, user_id, pessoas) {
+  const conj = await getConjuges(user_id);
+  if (!conj.length) return pessoas;
+
+  const out = [...pessoas];
+  const re = /(m[aã]e|pai)\s+da?\s+([A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\s'.-]{1,60})/gi;
+  let m;
+  while ((m = re.exec(texto)) !== null) {
+    const tipo = normalize(m[1]);       // mae|mãe|pai
+    const alvo = m[2].trim();           // “Lu Ivo”, “Luciana”, etc.
+
+    // se o alvo for o cônjuge, mapeia
+    const eConjuge = conj.some(v => matchNomeOuAlias(v, alvo));
+    if (eConjuge) {
+      const mapped = tipo.startsWith("p") ? "sogro" : "sogra";
+      // encontra uma pessoa correspondente na extração para ajustar
+      for (const p of out) {
+        // se ela foi extraída como “mãe” ou “pai”, ajusta para sogra/sogro
+        const t = normalize(p.tipo_vinculo || "");
+        if ((t === "mae" || t === "mãe" || t === "pai")) {
+          p.tipo_vinculo = mapped;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+
+
+
+
+
+
 
 // monta bloco compacto de vínculos p/ colar no prompt
 function montarBlocoVinculos(vinculos = []) {
