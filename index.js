@@ -9,14 +9,61 @@ const { buscarConteudoBasePorTags } = require('./conteudo_utils'); // Conteúdo 
 
 const app = express();
 
+/* ========= Core middlewares ========= */
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '1mb' }));
 
-// ====== [VÍNCULOS DINÂMICOS] Extração + deduplicação + upsert =================
+// CORS com whitelist (ajuste os domínios do seu front)
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:3001')
+  .split(',')
+  .map((s) => s.trim());
 
-const OPENAI_EXTRACT_MODEL = "gpt-4o-mini";
+// Middleware CORS
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true); // Permite requests sem origin (Postman, curl)
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+/* ========= Healthcheck ========= */
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+/* ========= Supabase & OpenAI ========= */
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  // usa SUPABASE_KEY (service_role) e mantém compatível com outros nomes
+  process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY
+);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// (Opcional) disponibiliza o supabase em req
+app.use((req, _res, next) => {
+  req.supabase = supabase;
+  next();
+});
+
+// Rota raiz simples p/ teste
+app.get('/', (_req, res) => res.send('API Mentor 360 funcionando!'));
+
+/* ========= Utils locais ========= */
+const OPENAI_EXTRACT_MODEL = 'gpt-4o-mini';
 
 // normaliza strings para comparação (minúsculas, sem acentos, trim)
-const normalize = (s = "") =>
-  s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+const normalize = (s = '') =>
+  s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
 
 // une arrays removendo duplicadas (case-insensitive)
 const uniqMerge = (a = [], b = []) => {
@@ -28,459 +75,8 @@ const uniqMerge = (a = [], b = []) => {
   return out;
 };
 
-// vínculos considerados "exclusivos" (só pode existir 1 por usuário)
-const VINCULO_EXCLUSIVO = new Set(["esposa", "esposo", "cônjuge", "conjuge", "marido"]);
-
-// extrai pessoas citadas com ajuda do LLM (nome, apelidos, vínculo)
-async function extrairPessoasDaMensagem(texto) {
-  const sys = `Extraia pessoas citadas da mensagem. Responda EXATAMENTE este JSON:
-[
-  {
-    "nome_real": "string | ou vazio se não souber",
-    "apelidos": ["array de apelidos ou variações"],
-    "tipo_vinculo": "pai|mae|mãe|irmao|irma|filho|filha|esposa|esposo|conjuge|namorada|namorado|eu mesmo|amigo|colega|desconhecido",
-    "observacao": "curto contexto se útil (opcional)"
-  }
-
-
-
-
-
-
-
-
-// --- Helpers para desambiguação ---
-const isWeakAlias = (s = "") => {
-  const t = normalize(s);
-  // aliases de 1 palavra e com <= 3 letras são fracos (ex.: "Lu", "Jo", "Pa")
-  if (!t) return true;
-  const words = t.split(/\s+/);
-  if (words.length === 1 && t.length <= 3) return true;
-  return false;
-};
-
-// mapeia grupos de parentesco p/ evitar merges cruzados
-const familyGroup = (tipo = "") => {
-  const t = normalize(tipo);
-  if (["esposa","esposo","conjuge","cônjuge","marido","namorada","namorado","parceira","parceiro"].includes(t)) return "conjugal";
-  if (["irma","irmão","irmao","irmã"].includes(t)) return "irmao";
-  if (["mae","mãe","pai","sogra","sogro"].includes(t)) return "parental";
-  if (["filho","filha"].includes(t)) return "filhos";
-  return "outros";
-};
-
-// checa se dois tipos pertencem a grupos diferentes e “conflitantes”
-const groupsConflict = (a, b) => {
-  const ga = familyGroup(a);
-  const gb = familyGroup(b);
-  if (ga === gb) return false;
-
-  // conjugal nunca deve mesclar com irmãos/parental sem evidência forte (nome completo)
-  const conflictPairs = new Set([
-    "conjugal|irmao", "irmao|conjugal",
-    "conjugal|parental", "parental|conjugal",
-  ]);
-
-  const key = ga + "|" + gb; // evita template literal
-  return conflictPairs.has(key);
-};
-
-
-
-
-
-
-
-
-]
-- Não invente nomes; preserve apelidos como foram ditos (ex.: "Lu Braga", "JEA", "Paulinho").
-- Se a mensagem mencionar "meu marido/minha esposa" sem nome, retorne tipo_vinculo correto e apelido vazio.
-- Se a pessoa for o próprio usuário (ex.: "eu mesmo"), use tipo_vinculo "eu mesmo".`;
-
-  const userMsg = `Mensagem: """${texto}"""`;
-
-  const r = await openai.chat.completions.create({
-    model: OPENAI_EXTRACT_MODEL,
-    temperature: 0,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: userMsg },
-    ],
-    max_tokens: 300,
-  });
-
-  let raw = r.choices?.[0]?.message?.content?.trim() || "[]";
-  // remove ```json ... ```
-  raw = raw.replace(/^```json\s*/i, "").replace(/^```/, "").replace(/```$/, "").trim();
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed;
-  } catch (_) {}
-  return [];
-}
-
-// busca todos os vínculos já existentes do usuário (uma vez por mensagem)
-async function fetchVinculosExistentes(user_id) {
-  const { data, error } = await supabase
-    .from("vinculos_usuario")
-    .select("*")
-    .eq("user_id", user_id);
-
-  if (error) {
-    console.error("Erro ao buscar vínculos existentes:", error);
-    return [];
-  }
-  return data || [];
-}
-
-
-
-
-
-
-
-
-// encontra um vínculo existente por (alias match) ou por nome normalizado
-function encontrarMatchVinculo(existing = [], { nome_real, apelidos = [], tipo_vinculo }) {
-  const nomeN = normalize(nome_real || "");
-  const aliasesN = (apelidos || []).map(normalize);
-
-  let best = null;
-  let bestScore = -1;
-
-  for (const v of existing) {
-    let score = 0;
-
-    const vNome = normalize(v.nome_real || "");
-    const vAliases = (v.apelidos_descricoes || []).map(normalize);
-
-    // evidências fortes
-    if (nomeN && vNome && nomeN === vNome) score += 6;
-
-    // alias composto (>= 2 palavras) bate? forte
-    const composedAliasHit = aliasesN.some(a => a.includes(" ") && vAliases.includes(a));
-    if (composedAliasHit) score += 5;
-
-    // alias curto/fraco
-    const weakOverlap = aliasesN.some(a => !a.includes(" ") && vAliases.includes(a));
-    if (weakOverlap) {
-      // só conta se o tipo de vínculo não conflita
-      if (!groupsConflict(v.tipo_vinculo || "", tipo_vinculo || "")) score += 2;
-    }
-
-    // semelhança por tokens do nome (quando ambos têm nome)
-    if (nomeN && vNome && !score) {
-      const a = new Set(nomeN.split(/\s+/));
-      const b = new Set(vNome.split(/\s+/));
-      const inter = [...a].filter(x => b.has(x)).length;
-      const jacc = inter / Math.max(1, a.size + b.size - inter);
-      if (jacc >= 0.7) score += 4;
-    }
-
-    // se há conflito de grupos, exija evidência muito forte
-    const conflict = groupsConflict(v.tipo_vinculo || "", tipo_vinculo || "");
-    const strongEvidence = (nomeN && vNome && nomeN === vNome) || composedAliasHit;
-
-    if (conflict && !strongEvidence) continue; // não mescla
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = v;
-    }
-  }
-
-  // limiar mínimo p/ mesclar
-  // 5 = nome igual ou alias composto igual; 4 = similaridade alta
-  return bestScore >= 5 ? best : null;
-}
-
-
-
-
-
-
-
-// upsert de um único vínculo (fundindo alias, frequência, histórico, última menção)
-async function upsertVinculo(user_id, pessoa, agoraISO, trechoMensagem = "") {
-  const existentes = await fetchVinculosExistentes(user_id);
-  const match = encontrarMatchVinculo(existentes, pessoa);
-
-  const novoHistoricoItem = {
-    data: agoraISO,
-    trecho: (trechoMensagem || "").slice(0, 240),
-  };
-
-  if (match) {
-    // merge
-    const apelidosNew = uniqMerge(match.apelidos_descricoes || [], pessoa.apelidos || []);
-    const marcadorEmocional = match.marcador_emocional || []; // mantenha como está por enquanto
-    const contextosRelevantes = match.contextos_relevantes || [];
-
-    // nome_real: se não tinha, ou se o novo parece “melhor” (mais longo), atualiza
-    const nomeAtual = match.nome_real || "";
-    const nomeNovo = pessoa.nome_real || "";
-    const nomeFinal =
-      (!nomeAtual && nomeNovo) || (nomeNovo && nomeNovo.length > nomeAtual.length) ? nomeNovo : nomeAtual;
-
-    // histórico (limite 12)
-    const historico = Array.isArray(match.historico_mencoes) ? match.historico_mencoes : [];
-    const historicoNovo = [...historico, novoHistoricoItem].slice(-12);
-
-    const { error } = await supabase
-      .from("vinculos_usuario")
-      .update({
-        nome_real: nomeFinal || match.nome_real,
-        tipo_vinculo: pessoa.tipo_vinculo || match.tipo_vinculo,
-        apelidos_descricoes: apelidosNew,
-        marcador_emocional: marcadorEmocional,
-        contextos_relevantes: contextosRelevantes,
-        frequencia_mencao: (match.frequencia_mencao || 0) + 1,
-        ultima_mencao: agoraISO,
-        historico_mencoes: historicoNovo,
-      })
-      .eq("id", match.id);
-
-    if (error) console.error("Erro update vínculo:", error);
-    return match.id;
-  }
-
-  // insert novo
-  const toInsert = {
-    user_id,
-    nome_real: pessoa.nome_real || null,
-    tipo_vinculo: pessoa.tipo_vinculo || "desconhecido",
-    apelidos_descricoes: pessoa.apelidos || [],
-    marcador_emocional: [], // pode ser alimentado depois
-    contextos_relevantes: [],
-    frequencia_mencao: 1,
-    ultima_mencao: agoraISO,
-    historico_mencoes: [novoHistoricoItem],
-    perfil_compacto: null,
-  };
-
-  const { data, error } = await supabase
-    .from("vinculos_usuario")
-    .insert([toInsert])
-    .select("id")
-    .single();
-
-  if (error) {
-    console.error("Erro insert vínculo:", error);
-    return null;
-  }
-  return data?.id || null;
-}
-
-// gera/atualiza perfil_compacto (barato, mini) com base no que já sabemos
-async function atualizarPerfilCompacto(vinculoId) {
-  if (!vinculoId) return;
-
-  const { data: v, error } = await supabase
-    .from("vinculos_usuario")
-    .select("nome_real, tipo_vinculo, apelidos_descricoes, marcador_emocional, contextos_relevantes, perfil_compacto")
-    .eq("id", vinculoId)
-    .single();
-
-  if (error || !v) return;
-
-  // monta um texto curto como input
-  const base = `
-Nome: ${v.nome_real || "(não informado)"}
-Vínculo: ${v.tipo_vinculo || "-"}
-Apelidos: ${(v.apelidos_descricoes || []).join(", ") || "-"}
-Emoções-chave: ${(v.marcador_emocional || []).join(", ") || "-"}
-Contextos: ${(v.contextos_relevantes || []).join(", ") || "-"}
-`.trim();
-
-  const sys = `Resuma em 1-2 frases, úteis para personalizar respostas em um chat.
-Seja factual, curto e sem conselhos.`;
-  const r = await openai.chat.completions.create({
-    model: OPENAI_EXTRACT_MODEL,
-    temperature: 0.2,
-    max_tokens: 90,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: base },
-    ],
-  });
-  const resumo = r.choices?.[0]?.message?.content?.trim();
-  if (!resumo) return;
-
-  await supabase
-    .from("vinculos_usuario")
-    .update({ perfil_compacto: resumo })
-    .eq("id", vinculoId);
-}
-
-// === API para a rota /ia usar ===
-// processa uma mensagem inteira: extrai todas as pessoas, upserta, e retorna nomes/aliases citados
-async function processarVinculosUsuario(texto, user_id) {
-  const pessoas = await extrairPessoasDaMensagem(texto);
-
-
-
-
-
-
-const pessoasAjustadas = await inferirParentescoRelativo(texto, user_id, pessoas);
-
-
-
-
-
-
-
-
-
-  const agoraISO = new Date().toISOString();
-
-  const idsAtualizados = [];
-  const nomesOuApelidosCitados = [];
-
-  for (const p of pessoasAjustadas) {
-    // garante campos básicos
-    p.apelidos = Array.isArray(p.apelidos) ? p.apelidos.filter(Boolean) : [];
-    if (p.nome_real) nomesOuApelidosCitados.push(p.nome_real);
-    nomesOuApelidosCitados.push(...p.apelidos);
-
-    // upsert com deduplicação (inclui regra de cônjuge exclusivo)
-    const id = await upsertVinculo(user_id, p, agoraISO, texto);
-    if (id) {
-      idsAtualizados.push(id);
-      // atualiza/gera perfil compacto (assíncrono, mas aguardamos para beta)
-      await atualizarPerfilCompacto(id);
-    }
-  }
-
-  return nomesOuApelidosCitados.filter(Boolean);
-}
-
-// seleciona vínculos p/ contexto (prioriza citados; senão top por frequência/recência)
-async function selecionarVinculosParaContexto(user_id, nomesCitados = [], limite = 3) {
-  const { data, error } = await supabase
-    .from("vinculos_usuario")
-    .select("id, nome_real, tipo_vinculo, apelidos_descricoes, perfil_compacto, frequencia_mencao, ultima_mencao")
-    .eq("user_id", user_id);
-
-  if (error || !data) return [];
-
-  const nomesN = nomesCitados.map(normalize);
-  const citados = [];
-  const outros = [];
-
-  for (const v of data) {
-    const nomeMatch = nomesN.includes(normalize(v.nome_real || ""));
-    const aliasMatch = (v.apelidos_descricoes || []).some((a) => nomesN.includes(normalize(a)));
-    if (nomeMatch || aliasMatch) citados.push(v);
-    else outros.push(v);
-  }
-
-  // ordena “outros” por frequência e recência
-  outros.sort((a, b) => {
-    const f = (b.frequencia_mencao || 0) - (a.frequencia_mencao || 0);
-    if (f !== 0) return f;
-    const da = new Date(a.ultima_mencao || 0).getTime();
-    const db = new Date(b.ultima_mencao || 0).getTime();
-    return db - da;
-  });
-
-  const selecionados = [...citados, ...outros].slice(0, limite);
-  return selecionados;
-}
-
-
-
-
-
-
-// retorna array de registros de cônjuge p/ o user
-async function getConjuges(user_id) {
-  const { data } = await supabase
-    .from("vinculos_usuario")
-    .select("id, nome_real, apelidos_descricoes, tipo_vinculo")
-    .eq("user_id", user_id);
-  const conj = (data || []).filter(v =>
-    ["esposa","esposo","conjuge","cônjuge","marido","namorada","namorado","parceira","parceiro"]
-      .includes(normalize(v.tipo_vinculo))
-  );
-  return conj;
-}
-
-function matchNomeOuAlias(v, alvo) {
-  const t = normalize(alvo);
-  if (!t) return false;
-  if (normalize(v.nome_real || "") === t) return true;
-  const aliases = (v.apelidos_descricoes || []).map(normalize);
-  return aliases.includes(t);
-}
-
-// “mãe/pai de <nome>” → sogra/sogro se <nome> = cônjuge
-async function inferirParentescoRelativo(texto, user_id, pessoas) {
-  const conj = await getConjuges(user_id);
-  if (!conj.length) return pessoas;
-
-  const out = [...pessoas];
-  const re = /(m[aã]e|pai)\s+da?\s+([A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\s'.-]{1,60})/gi;
-  let m;
-  while ((m = re.exec(texto)) !== null) {
-    const tipo = normalize(m[1]);       // mae|mãe|pai
-    const alvo = m[2].trim();           // “Lu Ivo”, “Luciana”, etc.
-
-    // se o alvo for o cônjuge, mapeia
-    const eConjuge = conj.some(v => matchNomeOuAlias(v, alvo));
-    if (eConjuge) {
-      const mapped = tipo.startsWith("p") ? "sogro" : "sogra";
-      // encontra uma pessoa correspondente na extração para ajustar
-      for (const p of out) {
-        // se ela foi extraída como “mãe” ou “pai”, ajusta para sogra/sogro
-        const t = normalize(p.tipo_vinculo || "");
-        if ((t === "mae" || t === "mãe" || t === "pai")) {
-          p.tipo_vinculo = mapped;
-        }
-      }
-    }
-  }
-  return out;
-}
-
-
-
-
-
-
-
-
-// monta bloco compacto de vínculos p/ colar no prompt
-function montarBlocoVinculos(vinculos = []) {
-  if (!vinculos.length) return "—";
-  return vinculos
-    .map((v) => {
-      const apelidos = (v.apelidos_descricoes || []).join(", ");
-      const perfil = v.perfil_compacto || "";
-      return `- ${v.nome_real || "(sem nome)"} — [${v.tipo_vinculo || "-"}]${apelidos ? ` | apelidos: ${apelidos}` : ""}${perfil ? `\n  Perfil: ${perfil}` : ""}`;
-    })
-    .join("\n");
-}
-
-
-
-app.use(cors());
-app.use(express.json());
-
-// ---------------------------------------------------------------------
-// Supabase & OpenAI
-// ---------------------------------------------------------------------
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// (opcional) rota raiz simples p/ teste
-app.get('/', (_req, res) => res.send('API Mentor 360 funcionando!'));
-
-// ---------------------------------------------------------------------
-// Utilitários locais
-// ---------------------------------------------------------------------
 function uniq(arr) {
-  return Array.from(new Set(arr.filter(Boolean)));
+  return Array.from(new Set((arr || []).filter(Boolean)));
 }
 function limitArr(arr, n) {
   if (!Array.isArray(arr)) return [];
@@ -494,223 +90,347 @@ function safeParseJSON(str, fallback = null) {
   }
 }
 
-// Gera/atualiza um perfil compacto (curto) de uma pessoa.
-// Regra: tenta usar GPT “mini” (barato). Se falhar, usa um resumo local.
-async function gerarPerfilCompacto({ nome_real, tipo_vinculo, marcador_emocional = [], contextos_relevantes = [] }) {
-  const localFallback = `${nome_real} — ${tipo_vinculo || 'vínculo'}; emoções: ${uniq(marcador_emocional).join(', ') || '—'}; contextos: ${limitArr(contextos_relevantes, 2).join(' / ') || '—'}`;
-  try {
-    const prompt = `
-Resuma em NO MÁXIMO 2 frases, de forma objetiva e útil para um assistente conversacional, o vínculo abaixo.
-Campos:
-- Nome
-- Tipo de vínculo
-- Emoções predominantes (se houver)
-- Contextos frequentes (se houver)
-Produza uma só linha curta, sem títulos.
-
-Dados:
-${JSON.stringify({ nome_real, tipo_vinculo, marcador_emocional, contextos_relevantes })}
-`;
-    const r = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.2,
-      max_tokens: 120,
-    });
-    const txt = r.choices?.[0]?.message?.content?.trim();
-    if (!txt) return localFallback;
-    // remove eventuais crases/blocos
-    return txt.replace(/^```.*\n?/g, '').replace(/```$/g, '').trim();
-  } catch {
-    return localFallback;
-  }
-}
-
-// Detecta pessoas mencionadas na mensagem e atualiza/insere em vinculos_usuario.
-// Retorna a lista de nomes/aliases detectados (para usarmos no contexto).
-async function processarVinculosUsuario(mensagem, user_id) {
-  try {
-    const promptDeteccao = `
-Analise a mensagem abaixo e retorne SOMENTE um JSON (array) com as pessoas mencionadas.
-Formato:
+/* ========= Extração de pessoas citadas ========= */
+async function extrairPessoasDaMensagem(texto) {
+  const sys = `Extraia pessoas citadas da mensagem. Responda EXATAMENTE este JSON:
 [
   {
-    "nome_real": "Nome da pessoa (se souber)",
-    "apelidos_descricoes": ["apelido1","apelido2"],
-    "tipo_vinculo": "ex.: esposa, amigo, mãe, chefe",
-    "marcador_emocional": ["emoções principais, ex.: amor, raiva, culpa"],
-    "contexto_relevante": "frase curta do contexto em que a pessoa foi citada"
+    "nome_real": "string ou vazio se não souber",
+    "apelidos": ["array de apelidos ou variações"],
+    "tipo_vinculo": "pai|mae|mãe|irmao|irmã|filho|filha|esposa|esposo|conjuge|namorada|namorado|eu mesmo|amigo|colega|desconhecido",
+    "observacao": "curto contexto se útil (opcional)"
   }
 ]
-Se não houver pessoas, retorne [].
-Mensagem:
-"""${mensagem}"""
-`;
-    const det = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: promptDeteccao }],
-      temperature: 0,
-      max_tokens: 300,
-    });
+- Não invente nomes; preserve apelidos como foram ditos (ex.: "Lu Braga", "JEA", "Paulinho").
+- Se a mensagem mencionar "meu marido/minha esposa" sem nome, retorne tipo_vinculo correto e apelido vazio.
+- Se a pessoa for o próprio usuário (ex.: "eu mesmo"), use tipo_vinculo "eu mesmo".`;
 
-    let pessoasDetectadas = safeParseJSON(det.choices?.[0]?.message?.content, []);
-    if (!Array.isArray(pessoasDetectadas)) pessoasDetectadas = [];
+  const userMsg = `Mensagem: """${texto}"""`;
 
-    if (pessoasDetectadas.length === 0) return [];
+  const r = await openai.chat.completions.create({
+    model: OPENAI_EXTRACT_MODEL,
+    temperature: 0,
+    messages: [
+      { role: 'system', content: sys },
+      { role: 'user', content: userMsg },
+    ],
+    max_tokens: 300,
+  });
 
-    // Carrega vínculos existentes do usuário para match por nome/alias em memória (mais flexível)
-    const { data: existentesAll } = await supabase
-      .from('vinculos_usuario')
-      .select('*')
-      .eq('user_id', user_id);
+  let raw = r.choices?.[0]?.message?.content?.trim() || '[]';
+  // remove ```json ... ```
+  raw = raw.replace(/^```json\s*/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+  } catch (_) {}
+  return [];
+}
 
-    const agoraISO = new Date().toISOString();
-    const nomesOuApelidosMencionados = [];
+/* ========= Regras de desambiguação de vínculos ========= */
+const familyGroup = (tipo = '') => {
+  const t = normalize(tipo);
+  if (
+    ['esposa', 'esposo', 'conjuge', 'cônjuge', 'marido', 'namorada', 'namorado', 'parceira', 'parceiro'].includes(t)
+  )
+    return 'conjugal';
+  if (['irma', 'irmão', 'irmao', 'irmã'].includes(t)) return 'irmao';
+  if (['mae', 'mãe', 'pai', 'sogra', 'sogro'].includes(t)) return 'parental';
+  if (['filho', 'filha'].includes(t)) return 'filhos';
+  return 'outros';
+};
 
-    for (const pessoa of pessoasDetectadas) {
-      const nome_real = (pessoa.nome_real || '').trim();
-      const apelidos_descricoes = Array.isArray(pessoa.apelidos_descricoes)
-        ? uniq(pessoa.apelidos_descricoes.map(s => String(s).trim()).filter(Boolean))
-        : [];
-      const tipo_vinculo = (pessoa.tipo_vinculo || '').trim();
-      const marcador_emocional = Array.isArray(pessoa.marcador_emocional)
-        ? uniq(pessoa.marcador_emocional.map(s => String(s).trim()).filter(Boolean))
-        : [];
-      const contexto_relevante = (pessoa.contexto_relevante || '').trim();
+const groupsConflict = (a, b) => {
+  const ga = familyGroup(a);
+  const gb = familyGroup(b);
+  if (ga === gb) return false;
+  const conflictPairs = new Set(['conjugal|irmao', 'irmao|conjugal', 'conjugal|parental', 'parental|conjugal']);
+  const key = ga + '|' + gb;
+  return conflictPairs.has(key);
+};
 
-      // tenta achar match por nome_real ou por apelido
-      let atual = null;
-      if (existentesAll && existentesAll.length) {
-        atual =
-          existentesAll.find(v => v.nome_real?.toLowerCase() === nome_real.toLowerCase() && nome_real) ||
-          existentesAll.find(v => {
-            const aliases = Array.isArray(v.apelidos_descricoes) ? v.apelidos_descricoes.map(a => (a || '').toLowerCase()) : [];
-            return apelidos_descricoes.some(a => aliases.includes(a.toLowerCase()));
-          });
-      }
-
-      // Arrays que vamos atualizar
-      const novoHistorico = [{ data: agoraISO, trecho: mensagem }];
-      const novosContextos = contexto_relevante ? [contexto_relevante] : [];
-
-      if (atual) {
-        const historico = Array.isArray(atual.historico_mencoes) ? atual.historico_mencoes : [];
-        const contextos = Array.isArray(atual.contextos_relevantes) ? atual.contextos_relevantes : [];
-        const tags = Array.isArray(atual.tags_associadas) ? atual.tags_associadas : [];
-        const emoc = Array.isArray(atual.marcador_emocional) ? atual.marcador_emocional : [];
-        const aliases = Array.isArray(atual.apelidos_descricoes) ? atual.apelidos_descricoes : [];
-
-        const atualizado = {
-      ultima_mencao: agoraISO,
-      frequencia_mencao: (atual.frequencia_mencao || 0) + 1,
-      historico_mencoes: limitArr([...historico, ...novoHistorico], 5),
-      contextos_relevantes: limitArr(uniq([...contextos, ...novosContextos]), 3),
-      tags_associadas: uniq([...tags, tipo_vinculo].filter(Boolean)),
-      marcador_emocional: uniq([...emoc, ...marcador_emocional]),
-      apelidos_descricoes: uniq([...aliases, ...apelidos_descricoes].filter(Boolean)),
-        };
-
-        // Atualiza e, se mudar bastante, regera perfil_compacto
-        let perfil_compacto = atual.perfil_compacto;
-        const mudouMuito =
-          atualizado.frequencia_mencao % 3 === 0 ||
-          (atualizado.marcador_emocional.length || 0) > (emoc.length || 0) ||
-          (atualizado.contextos_relevantes.length || 0) > (contextos.length || 0);
-
-        if (mudouMuito) {
-          perfil_compacto = await gerarPerfilCompacto({
-            nome_real: atual.nome_real || nome_real || (apelidos_descricoes[0] || 'Pessoa'),
-            tipo_vinculo: atual.tipo_vinculo || tipo_vinculo,
-            marcador_emocional: atualizado.marcador_emocional,
-            contextos_relevantes: atualizado.contextos_relevantes,
-          });
-          atualizado.perfil_compacto = perfil_compacto;
-        }
-
-        await supabase.from('vinculos_usuario').update(atualizado).eq('id', atual.id);
-        nomesOuApelidosMencionados.push(nome_real || apelidos_descricoes[0] || atual.nome_real);
-      } else {
-        // Novo registro
-        const inicial = {
-          user_id,
-          nome_real: nome_real || (apelidos_descricoes[0] || 'Pessoa'),
-          apelidos_descricoes,
-          tipo_vinculo,
-          marcador_emocional,
-          primeira_mencao: agoraISO,
-          ultima_mencao: agoraISO,
-          frequencia_mencao: 1,
-          historico_mencoes: novoHistorico,
-          contextos_relevantes: novosContextos,
-          tags_associadas: uniq([tipo_vinculo].filter(Boolean)),
-        };
-        inicial.perfil_compacto = await gerarPerfilCompacto({
-          nome_real: inicial.nome_real,
-          tipo_vinculo: inicial.tipo_vinculo,
-          marcador_emocional: inicial.marcador_emocional,
-          contextos_relevantes: inicial.contextos_relevantes,
-        });
-
-        const { data: inserido } = await supabase.from('vinculos_usuario').insert([inicial]).select().limit(1);
-        if (inserido && inserido[0]) {
-          nomesOuApelidosMencionados.push(inserido[0].nome_real || (apelidos_descricoes[0] || 'Pessoa'));
-        }
-      }
-    }
-
-    return uniq(nomesOuApelidosMencionados);
-  } catch (error) {
-    console.error('Erro ao processar vínculos:', error);
+// busca todos os vínculos já existentes do usuário
+async function fetchVinculosExistentes(user_id) {
+  const { data, error } = await supabase.from('vinculos_usuario').select('*').eq('user_id', user_id);
+  if (error) {
+    console.error('Erro ao buscar vínculos existentes:', error);
     return [];
   }
+  return data || [];
 }
 
-// Seleciona vínculos relevantes para a mensagem atual.
-// Prioriza pessoas citadas; se nada for citado, retorna top 3 por frequência/recência.
-async function selecionarVinculosParaContexto(user_id, nomesOuApelidos = []) {
-  const { data: todos } = await supabase
-    .from('vinculos_usuario')
-    .select('nome_real, apelidos_descricoes, marcador_emocional, contextos_relevantes, perfil_compacto, frequencia_mencao, ultima_mencao')
-    .eq('user_id', user_id);
+// encontra match por nome/alias com regras de conflito
+function encontrarMatchVinculo(existing = [], { nome_real, apelidos = [], tipo_vinculo }) {
+  const nomeN = normalize(nome_real || '');
+  const aliasesN = (apelidos || []).map(normalize);
 
-  if (!todos || todos.length === 0) return [];
+  let best = null;
+  let bestScore = -1;
 
-  const lower = s => (s || '').toLowerCase();
-  const citados = [];
-  if (nomesOuApelidos.length) {
-    for (const v of todos) {
-      const matchPorNome = nomesOuApelidos.some(n => lower(v.nome_real) === lower(n));
-      const aliases = Array.isArray(v.apelidos_descricoes) ? v.apelidos_descricoes.map(a => lower(a)) : [];
-      const matchPorAlias = nomesOuApelidos.some(n => aliases.includes(lower(n)));
-      if (matchPorNome || matchPorAlias) citados.push(v);
+  for (const v of existing) {
+    let score = 0;
+
+    const vNome = normalize(v.nome_real || '');
+    const vAliases = (v.apelidos_descricoes || []).map(normalize);
+
+    if (nomeN && vNome && nomeN === vNome) score += 6;
+
+    const composedAliasHit = aliasesN.some((a) => a.includes(' ') && vAliases.includes(a));
+    if (composedAliasHit) score += 5;
+
+    const weakOverlap = aliasesN.some((a) => !a.includes(' ') && vAliases.includes(a));
+    if (weakOverlap) {
+      if (!groupsConflict(v.tipo_vinculo || '', tipo_vinculo || '')) score += 2;
+    }
+
+    if (nomeN && vNome && !score) {
+      const a = new Set(nomeN.split(/\s+/));
+      const b = new Set(vNome.split(/\s+/));
+      const inter = [...a].filter((x) => b.has(x)).length;
+      const jacc = inter / Math.max(1, a.size + b.size - inter);
+      if (jacc >= 0.7) score += 4;
+    }
+
+    const conflict = groupsConflict(v.tipo_vinculo || '', tipo_vinculo || '');
+    const strongEvidence = (nomeN && vNome && nomeN === vNome) || composedAliasHit;
+    if (conflict && !strongEvidence) continue;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = v;
     }
   }
 
-  if (citados.length > 0) {
-    // limita a no máx. 5
-    return citados.slice(0, 5);
-  }
-
-  // Fallback: top 3 por frequência e recência
-  return [...todos]
-    .sort((a, b) => (b.frequencia_mencao || 0) - (a.frequencia_mencao || 0) || new Date(b.ultima_mencao || 0) - new Date(a.ultima_mencao || 0))
-    .slice(0, 3);
+  return bestScore >= 5 ? best : null;
 }
 
-function montarBlocoVinculos(vinculos) {
-  if (!vinculos || vinculos.length === 0) return 'Sem pessoas relevantes detectadas para esta conversa.';
-  let out = 'Pessoas relevantes para considerar nesta resposta (perfis compactos):\n';
-  vinculos.forEach(v => {
-    const emoc = Array.isArray(v.marcador_emocional) ? v.marcador_emocional.join(', ') : '';
-    const ctx = Array.isArray(v.contextos_relevantes) ? v.contextos_relevantes.join(' / ') : '';
-    out += `- ${v.perfil_compacto || `${v.nome_real} — emoções: ${emoc || '—'}; contextos: ${ctx || '—'}`}\n`;
-  });
+// retorna array de registros de cônjuge p/ o user
+async function getConjuges(user_id) {
+  const { data } = await supabase
+    .from('vinculos_usuario')
+    .select('id, nome_real, apelidos_descricoes, tipo_vinculo')
+    .eq('user_id', user_id);
+  const conj = (data || []).filter((v) =>
+    [
+      'esposa',
+      'esposo',
+      'conjuge',
+      'cônjuge',
+      'marido',
+      'namorada',
+      'namorado',
+      'parceira',
+      'parceiro',
+    ].includes(normalize(v.tipo_vinculo))
+  );
+  return conj;
+}
+
+function matchNomeOuAlias(v, alvo) {
+  const t = normalize(alvo);
+  if (!t) return false;
+  if (normalize(v.nome_real || '') === t) return true;
+  const aliases = (v.apelidos_descricoes || []).map(normalize);
+  return aliases.includes(t);
+}
+
+// “mãe/pai de <nome>” → sogra/sogro se <nome> = cônjuge
+async function inferirParentescoRelativo(texto, user_id, pessoas) {
+  const conj = await getConjuges(user_id);
+  if (!conj.length) return pessoas;
+
+  const out = [...pessoas];
+  const re = /(m[aã]e|pai)\s+da?\s+([A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ\s'.-]{1,60})/gi;
+  let m;
+  while ((m = re.exec(texto)) !== null) {
+    const tipo = normalize(m[1]); // mae|mãe|pai
+    const alvo = m[2].trim(); // “Lu Ivo”, “Luciana”, etc.
+
+    const eConjuge = conj.some((v) => matchNomeOuAlias(v, alvo));
+    if (eConjuge) {
+      const mapped = tipo.startsWith('p') ? 'sogro' : 'sogra';
+      for (const p of out) {
+        const t = normalize(p.tipo_vinculo || '');
+        if (t === 'mae' || t === 'mãe' || t === 'pai') {
+          p.tipo_vinculo = mapped;
+        }
+      }
+    }
+  }
   return out;
 }
 
-// ---------------------------------------------------------------------
-// Rotas já existentes
-// ---------------------------------------------------------------------
+/* ========= Upsert de vínculos ========= */
+async function upsertVinculo(user_id, pessoa, agoraISO, trechoMensagem = '') {
+  const existentes = await fetchVinculosExistentes(user_id);
+  const match = encontrarMatchVinculo(existentes, pessoa);
+
+  const novoHistoricoItem = {
+    data: agoraISO,
+    trecho: (trechoMensagem || '').slice(0, 240),
+  };
+
+  if (match) {
+    const apelidosNew = uniqMerge(match.apelidos_descricoes || [], pessoa.apelidos || []);
+    const marcadorEmocional = match.marcador_emocional || [];
+    const contextosRelevantes = match.contextos_relevantes || [];
+
+    const nomeAtual = match.nome_real || '';
+    const nomeNovo = pessoa.nome_real || '';
+    const nomeFinal =
+      (!nomeAtual && nomeNovo) || (nomeNovo && nomeNovo.length > nomeAtual.length) ? nomeNovo : nomeAtual;
+
+    const historico = Array.isArray(match.historico_mencoes) ? match.historico_mencoes : [];
+    const historicoNovo = [...historico, novoHistoricoItem].slice(-12);
+
+    const { error } = await supabase
+      .from('vinculos_usuario')
+      .update({
+        nome_real: nomeFinal || match.nome_real,
+        tipo_vinculo: pessoa.tipo_vinculo || match.tipo_vinculo,
+        apelidos_descricoes: apelidosNew,
+        marcador_emocional: marcadorEmocional,
+        contextos_relevantes: contextosRelevantes,
+        frequencia_mencao: (match.frequencia_mencao || 0) + 1,
+        ultima_mencao: agoraISO,
+        historico_mencoes: historicoNovo,
+      })
+      .eq('id', match.id);
+
+    if (error) console.error('Erro update vínculo:', error);
+    return match.id;
+  }
+
+  const toInsert = {
+    user_id,
+    nome_real: pessoa.nome_real || null,
+    tipo_vinculo: pessoa.tipo_vinculo || 'desconhecido',
+    apelidos_descricoes: pessoa.apelidos || [],
+    marcador_emocional: [],
+    contextos_relevantes: [],
+    frequencia_mencao: 1,
+    ultima_mencao: agoraISO,
+    historico_mencoes: [novoHistoricoItem],
+    perfil_compacto: null,
+  };
+
+  const { data, error } = await supabase.from('vinculos_usuario').insert([toInsert]).select('id').single();
+
+  if (error) {
+    console.error('Erro insert vínculo:', error);
+    return null;
+  }
+  return data?.id || null;
+}
+
+// gera/atualiza perfil_compacto (barato, mini)
+async function atualizarPerfilCompacto(vinculoId) {
+  if (!vinculoId) return;
+
+  const { data: v, error } = await supabase
+    .from('vinculos_usuario')
+    .select('nome_real, tipo_vinculo, apelidos_descricoes, marcador_emocional, contextos_relevantes, perfil_compacto')
+    .eq('id', vinculoId)
+    .single();
+
+  if (error || !v) return;
+
+  const base = `
+Nome: ${v.nome_real || '(não informado)'}
+Vínculo: ${v.tipo_vinculo || '-'}
+Apelidos: ${(v.apelidos_descricoes || []).join(', ') || '-'}
+Emoções-chave: ${(v.marcador_emocional || []).join(', ') || '-'}
+Contextos: ${(v.contextos_relevantes || []).join(', ') || '-'}
+`.trim();
+
+  const sys = `Resuma em 1-2 frases, úteis para personalizar respostas em um chat. Seja factual, curto e sem conselhos.`;
+  const r = await openai.chat.completions.create({
+    model: OPENAI_EXTRACT_MODEL,
+    temperature: 0.2,
+    max_tokens: 90,
+    messages: [
+      { role: 'system', content: sys },
+      { role: 'user', content: base },
+    ],
+  });
+  const resumo = r.choices?.[0]?.message?.content?.trim();
+  if (!resumo) return;
+
+  await supabase.from('vinculos_usuario').update({ perfil_compacto: resumo }).eq('id', vinculoId);
+}
+
+/* ========= Pipeline de pessoas/vínculos ========= */
+async function processarVinculosUsuario(texto, user_id) {
+  const pessoas = await extrairPessoasDaMensagem(texto);
+  const pessoasAjustadas = await inferirParentescoRelativo(texto, user_id, pessoas);
+  const agoraISO = new Date().toISOString();
+
+  const idsAtualizados = [];
+  const nomesOuApelidosCitados = [];
+
+  for (const p of pessoasAjustadas) {
+    p.apelidos = Array.isArray(p.apelidos) ? p.apelidos.filter(Boolean) : [];
+    if (p.nome_real) nomesOuApelidosCitados.push(p.nome_real);
+    nomesOuApelidosCitados.push(...p.apelidos);
+
+    const id = await upsertVinculo(user_id, p, agoraISO, texto);
+    if (id) {
+      idsAtualizados.push(id);
+      await atualizarPerfilCompacto(id);
+    }
+  }
+
+  return nomesOuApelidosCitados.filter(Boolean);
+}
+
+// seleciona vínculos p/ contexto (prioriza citados; senão top por frequência/recência)
+async function selecionarVinculosParaContexto(user_id, nomesCitados = [], limite = 3) {
+  const { data, error } = await supabase
+    .from('vinculos_usuario')
+    .select(
+      'id, nome_real, tipo_vinculo, apelidos_descricoes, perfil_compacto, frequencia_mencao, ultima_mencao, marcador_emocional, contextos_relevantes'
+    )
+    .eq('user_id', user_id);
+
+  if (error || !data) return [];
+
+  const nomesN = nomesCitados.map(normalize);
+  const citados = [];
+  const outros = [];
+
+  for (const v of data) {
+    const nomeMatch = nomesN.includes(normalize(v.nome_real || ''));
+    const aliasMatch = (v.apelidos_descricoes || []).some((a) => nomesN.includes(normalize(a)));
+    if (nomeMatch || aliasMatch) citados.push(v);
+    else outros.push(v);
+  }
+
+  outros.sort((a, b) => {
+    const f = (b.frequencia_mencao || 0) - (a.frequencia_mencao || 0);
+    if (f !== 0) return f;
+    const da = new Date(a.ultima_mencao || 0).getTime();
+    const db = new Date(b.ultima_mencao || 0).getTime();
+    return db - da;
+  });
+
+  const selecionados = [...citados, ...outros].slice(0, limite);
+  return selecionados;
+}
+
+function montarBlocoVinculos(vinculos = []) {
+  if (!vinculos.length) return '—';
+  return vinculos
+    .map((v) => {
+      const apelidos = (v.apelidos_descricoes || []).join(', ');
+      const perfil = v.perfil_compacto || '';
+      return `- ${v.nome_real || '(sem nome)'} — [${v.tipo_vinculo || '-'}]${
+        apelidos ? ` | apelidos: ${apelidos}` : ''
+      }${perfil ? `\n  Perfil: ${perfil}` : ''}`;
+    })
+    .join('\n');
+}
+
+/* ========= Rotas ========= */
 
 // Rota para cadastrar pessoas importantes (form manual opcional)
 app.post('/pessoas', async (req, res) => {
@@ -719,17 +439,15 @@ app.post('/pessoas', async (req, res) => {
     if (!user_id || !Array.isArray(pessoas)) {
       return res.status(400).json({ erro: 'Dados inválidos' });
     }
-    const { data, error } = await supabase
-      .from('pessoas_importantes')
-      .insert(
-        pessoas.map(p => ({
-          user_id,
-          nome: p.nome,
-          apelido: p.apelido,
-          relacao: p.relacao,
-          sentimento: p.sentimento,
-        })),
-      );
+    const { data, error } = await supabase.from('pessoas_importantes').insert(
+      pessoas.map((p) => ({
+        user_id,
+        nome: p.nome,
+        apelido: p.apelido,
+        relacao: p.relacao,
+        sentimento: p.sentimento,
+      }))
+    );
     if (error) {
       console.error('Erro Supabase:', error);
       return res.status(500).json({ erro: 'Erro ao salvar no banco' });
@@ -748,10 +466,7 @@ app.post('/cadastro', async (req, res) => {
     return res.status(400).json({ erro: 'Preencha todos os campos.' });
   }
 
-  const { data: usuarios, error: errorSelect } = await supabase
-    .from('usuarios')
-    .select('*')
-    .eq('email', email);
+  const { data: usuarios, error: errorSelect } = await supabase.from('usuarios').select('*').eq('email', email);
 
   if (errorSelect) return res.status(500).json({ erro: 'Erro no banco de dados.' });
   if (usuarios && usuarios.length > 0) return res.status(409).json({ erro: 'E-mail já cadastrado.' });
@@ -764,13 +479,13 @@ app.post('/cadastro', async (req, res) => {
   return res.status(201).json({ mensagem: 'Cadastro realizado com sucesso!' });
 });
 
-// Login
+// Login (mantém /login para compatibilidade com seu front atual)
 app.post('/login', async (req, res) => {
-  const { email, senha } = req.body;
+  const { email, senha, acceptTerms } = req.body;
   if (!email || !senha) {
     return res.status(400).json({ erro: 'Preencha todos os campos.' });
   }
-  const { data: usuarios, error } = await supabase.from('usuarios').select('*').eq('email', email);
+  const { data: usuarios, error } = await supabase.from('usuarios').select('*').eq('email', email).limit(1);
   if (error) return res.status(500).json({ erro: 'Erro no banco de dados.' });
   if (!usuarios || usuarios.length === 0) return res.status(404).json({ erro: 'Usuário não encontrado.' });
 
@@ -778,7 +493,19 @@ app.post('/login', async (req, res) => {
   const senhaConfere = await bcrypt.compare(senha, usuario.senha_hash);
   if (!senhaConfere) return res.status(401).json({ erro: 'Senha incorreta.' });
 
-  return res.json({ mensagem: `Login autorizado! Bem-vindo(a), ${usuario.nome}`, user_id: usuario.id, nome: usuario.nome });
+  // registra aceite de termos se veio marcado e ainda não tem timestamp
+  if (acceptTerms && !usuario.accepted_terms_at) {
+    await supabase
+      .from('usuarios')
+      .update({ accepted_terms_at: new Date().toISOString() })
+      .eq('id', usuario.id);
+  }
+
+  return res.json({
+    mensagem: `Login autorizado! Bem-vindo(a), ${usuario.nome}`,
+    user_id: usuario.id,
+    nome: usuario.nome,
+  });
 });
 
 // Teste de tagging
@@ -793,27 +520,82 @@ app.post('/tag-teste', async (req, res) => {
   }
 });
 
-// Nova sessão
-app.post('/sessao', async (req, res) => {
+// Nova sessão: encerra a aberta (se houver) e cria outra (resiliente)
+app.post('/nova-sessao', async (req, res) => {
   const { user_id, mensagem } = req.body;
-  if (!user_id || !mensagem) return res.status(400).json({ erro: 'Informe user_id e mensagem.' });
+  if (!user_id) return res.status(400).json({ erro: 'Informe user_id.' });
 
-  const data_sessao = new Date().toISOString();
-  const resumo = mensagem;
-  const status = 'aberta';
-  const tags_tema = [];
-  const tags_risco = [];
-  const sentimentos_reportados = '';
+  try {
+    // encerra qualquer sessão aberta
+    await supabase
+      .from('sessoes')
+      .update({ status: 'encerrada', encerrada_em: new Date().toISOString() })
+      .eq('user_id', user_id)
+      .eq('status', 'aberta');
 
-  const { data, error } = await supabase
-    .from('sessoes')
-    .insert([{ user_id, data_sessao, resumo, status, pendencias: '', tags_tema, tags_risco, sentimentos_reportados }])
-    .select();
+    // tenta criar a nova
+    const { data: nova, error: insertErr } = await supabase
+      .from('sessoes')
+      .insert([{
+        user_id,
+        data_sessao: new Date().toISOString(),
+        resumo: mensagem || 'Início da sessão',
+        status: 'aberta'
+      }])
+      .select()
+      .single();
 
-  if (error) return res.status(500).json({ erro: 'Erro ao registrar sessão.' });
+    if (insertErr) {
+      // se UNIQUE/duplicada, reaproveita a existente
+      if (insertErr.code === '23505' || /unique/i.test(insertErr.message || '')) {
+        const { data: existente } = await supabase
+          .from('sessoes')
+          .select('*')
+          .eq('user_id', user_id)
+          .eq('status', 'aberta')
+          .order('data_sessao', { ascending: false })
+          .limit(1)
+          .maybeSingle();
 
-  return res.status(201).json({ mensagem: 'Sessão registrada com sucesso!', sessao: data[0] });
+        if (existente) return res.status(200).json({ mensagem: 'Sessão aberta reaproveitada', sessao: existente });
+        return res.status(500).json({ erro: 'Erro ao recuperar sessão aberta.' });
+      }
+      return res.status(500).json({ erro: 'Erro ao criar nova sessão.' });
+    }
+
+    return res.status(201).json({ mensagem: 'Nova sessão aberta', sessao: nova });
+  } catch (e) {
+    console.error('[EXC /nova-sessao]', e);
+    return res.status(500).json({ erro: 'Erro inesperado ao criar nova sessão.' });
+  }
 });
+
+
+// Retorna a sessão aberta mais recente (se existir)
+app.get('/sessao-aberta/:user_id', async (req, res) => {
+  const { user_id } = req.params;
+  if (!user_id) return res.status(400).json({ erro: 'Informe user_id.' });
+
+  try {
+    const { data, error } = await supabase
+      .from('sessoes')
+      .select('*')
+      .eq('user_id', user_id)
+      .eq('status', 'aberta')
+      .order('data_sessao', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ erro: 'Erro ao buscar sessão aberta.' });
+    if (!data) return res.status(404).json({ erro: 'Sem sessão aberta.' });
+
+    return res.json({ sessao: data });
+  } catch (e) {
+    console.error('[EXC /sessao-aberta]', e);
+    return res.status(500).json({ erro: 'Erro inesperado.' });
+  }
+});
+
 
 // Listar sessões do usuário
 app.get('/sessoes/:user_id', async (req, res) => {
@@ -830,7 +612,7 @@ app.get('/sessoes/:user_id', async (req, res) => {
   return res.json({ sessoes: data });
 });
 
-// Contexto completo (permanece como diagnóstico/apoio)
+// Contexto completo (diagnóstico/apoio)
 async function montarContextoCompleto(user_id) {
   const { data: perfil } = await supabase
     .from('perfil_psicologico')
@@ -865,21 +647,25 @@ async function montarContextoCompleto(user_id) {
 
   if (eventos && eventos.length > 0) {
     contexto += `Eventos de Vida Relevantes:\n`;
-    eventos.forEach(ev => {
+    eventos.forEach((ev) => {
       contexto += `- (${ev.data_evento}) ${ev.tipo_evento}: ${ev.descricao}\n`;
     });
   }
 
   if (vinculos && vinculos.length > 0) {
     contexto += `Vínculos Importantes:\n`;
-    vinculos.forEach(v => {
-      contexto += `- [${v.tipo_vinculo}] ${v.nome_real || v.apelidos_descricoes?.join('/') || 'Desconhecido'} (Emoção: ${v.marcador_emocional?.join(', ') || 'não informado'})\n`;
+    vinculos.forEach((v) => {
+      contexto += `- [${v.tipo_vinculo}] ${v.nome_real || v.apelidos_descricoes?.join('/') || 'Desconhecido'} (Emoção: ${
+        v.marcador_emocional?.join(', ') || 'não informado'
+      })\n`;
     });
   }
 
   contexto += `Últimas sessões:\n`;
-  sessoes?.forEach(sessao => {
-    contexto += `- ${new Date(sessao.data_sessao).toLocaleDateString()}: "${sessao.resumo}" | Temas: ${sessao.tags_tema?.join(', ') || '-'} | Riscos: ${sessao.tags_risco?.join(', ') || '-'}\n`;
+  sessoes?.forEach((sessao) => {
+    contexto += `- ${new Date(sessao.data_sessao).toLocaleDateString()}: "${sessao.resumo}" | Temas: ${
+      sessao.tags_tema?.join(', ') || '-'
+    } | Riscos: ${sessao.tags_risco?.join(', ') || '-'}\n`;
   });
 
   return contexto;
@@ -916,30 +702,24 @@ async function buscarResumosSemelhantes(supabaseClient, openaiClient, user_id, t
   }
   return data;
 }
-// (mantém export se algum outro arquivo requer)
 module.exports = { buscarResumosSemelhantes };
 
-// ---------------------------------------------------------------------
-// ---------------------------------------------------------------------
 // INTEGRAÇÃO COM GPT/OPENAI (AlanBot) — versão otimizada p/ beta
-// ---------------------------------------------------------------------
 app.post('/ia', async (req, res) => {
   const { user_id, sessao_id, mensagem } = req.body;
   if (!user_id || !sessao_id || !mensagem) {
     return res.status(400).json({ erro: 'Informe user_id, sessao_id e mensagem.' });
   }
 
-  // Helpers locais de corte (não-precisos em tokens, mas práticos)
   const cut = (txt = '', max = 800) => String(txt).slice(0, max);
   const cutLines = (arr = [], maxLines = 10, maxPerLine = 180) =>
-    arr.slice(-maxLines).map(l => cut(l, maxPerLine));
+    arr.slice(-maxLines).map((l) => cut(l, maxPerLine));
 
   try {
     // 1) Tagging em tempo real (temas) + conteúdos autorais do Alan (RAG)
     const tagsTema = await taggearMensagem(openai, mensagem);
-
     const conteudosBase = await buscarConteudoBasePorTags(supabase, tagsTema);
-    // Compacta em até 3 bullets curtos
+
     let contextoAlan = 'Conteúdo-base do Alan (compacto):\n';
     if (conteudosBase && conteudosBase.length > 0) {
       conteudosBase.slice(0, 3).forEach((item, i) => {
@@ -947,7 +727,9 @@ app.post('/ia', async (req, res) => {
           item?.conceito ? `• Conceito: ${item.conceito}` : null,
           item?.ferramentas_exercicios ? `• Ferramenta: ${item.ferramentas_exercicios}` : null,
           item?.frases_citacoes ? `• Citação: ${item.frases_citacoes}` : null,
-        ].filter(Boolean).join('\n');
+        ]
+          .filter(Boolean)
+          .join('\n');
         if (bloco) contextoAlan += `${i + 1}) Tema: ${item.tema}\n${cut(bloco, 350)}\n`;
       });
     } else {
@@ -962,9 +744,7 @@ app.post('/ia', async (req, res) => {
       .eq('sessao_id', sessao_id)
       .order('data_mensagem', { ascending: true });
 
-    const histTurnos = (histU || []).map(m =>
-      `${m.origem === 'usuario' ? 'U' : 'B'}: ${m.texto_mensagem}`.replace(/\s+/g, ' ')
-    );
+    const histTurnos = (histU || []).map((m) => `${m.origem === 'usuario' ? 'U' : 'B'}: ${m.texto_mensagem}`.replace(/\s+/g, ' '));
     const histCompacto = cutLines(histTurnos, 10, 180).join('\n');
     const contextoConversa = histCompacto
       ? `Histórico recente (compacto):\n${histCompacto}\n`
@@ -972,9 +752,10 @@ app.post('/ia', async (req, res) => {
 
     // 3) Memórias vetoriais relevantes (3 linhas curtas)
     const memorias = await buscarResumosSemelhantes(supabase, openai, user_id, mensagem, 3);
-    const contextoMemorias = memorias && memorias.length
-      ? 'Memórias relevantes:\n' + cutLines(memorias.map(m => `• ${m.resumo}`), 3, 220).join('\n') + '\n'
-      : 'Memórias relevantes:\n—\n';
+    const contextoMemorias =
+      memorias && memorias.length
+        ? 'Memórias relevantes:\n' + cutLines(memorias.map((m) => `• ${m.resumo}`), 3, 220).join('\n') + '\n'
+        : 'Memórias relevantes:\n—\n';
 
     // 4) Vínculos: atualiza/identifica citados e seleciona p/ contexto (prioriza citados)
     const nomesOuApelidos = await processarVinculosUsuario(mensagem, user_id);
@@ -984,13 +765,12 @@ app.post('/ia', async (req, res) => {
     // 5) Moldura do usuário (perfil/eventos/últimas sessões) — com corte
     const moldura = cut(await montarContextoCompleto(user_id), 1000);
 
-    // 6) Modo de segurança (opcional simples): se a mensagem tiver termos críticos, reduz a temperatura
+    // 6) Modo de segurança simples
     const riscoRegex = /(suicid|me matar|matar|viol[eê]ncia|me ferir|autoles[aã]o)/i;
     const isRisco = riscoRegex.test(mensagem);
     const temperatura = isRisco ? 0.2 : 0.3;
     const maxTokensResposta = isRisco ? 380 : 420;
 
-    // 7) System / Assistant (contexto) / User — arquitetura limpa
     const systemMsg = `
 Você é a versão virtual do Alan Fernandes, mentor de autoconhecimento.
 Estilo: informal, acolhedor, instrutivo, provocador e firme; 1 pergunta por vez; no máx. 2 opções de exercício.
@@ -1015,9 +795,6 @@ MOLDURA DO USUÁRIO:
 ${moldura}
 `.trim();
 
-    const userMsg = mensagem;
-
-    // 8) Chamada ao modelo
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
       temperature: temperatura,
@@ -1025,16 +802,14 @@ ${moldura}
       messages: [
         { role: 'system', content: systemMsg },
         { role: 'assistant', content: assistantContext },
-        { role: 'user', content: userMsg },
+        { role: 'user', content: mensagem },
       ],
     });
 
     const resposta = completion.choices[0].message.content?.trim() || '';
 
-    // 9) Salva a resposta do bot
-    await supabase.from('mensagens_sessao').insert([
-      { sessao_id, user_id, texto_mensagem: resposta, origem: 'bot' },
-    ]);
+    // salva a resposta do bot
+    await supabase.from('mensagens_sessao').insert([{ sessao_id, user_id, texto_mensagem: resposta, origem: 'bot' }]);
 
     return res.json({ resposta });
   } catch (error) {
@@ -1042,7 +817,8 @@ ${moldura}
     return res.status(500).json({ erro: 'Erro ao gerar resposta da IA.' });
   }
 });
-// Salvar mensagem individual na sessão (agora também processa vínculos se for do usuário)
+
+// Salvar mensagem individual na sessão (processa vínculos se for do usuário)
 app.post('/mensagem', async (req, res) => {
   const { sessao_id, user_id, texto_mensagem, origem } = req.body;
   if (!sessao_id || !user_id || !texto_mensagem) {
@@ -1086,7 +862,7 @@ app.get('/historico/:sessao_id', async (req, res) => {
   }
 });
 
-// Finalizar sessão (mantido com embeddings)
+// Finalizar sessão (com embeddings)
 app.post('/finalizar-sessao', async (req, res) => {
   const { sessao_id } = req.body;
   if (!sessao_id) return res.status(400).json({ error: 'sessao_id obrigatório' });
@@ -1099,10 +875,12 @@ app.post('/finalizar-sessao', async (req, res) => {
       .order('data_mensagem', { ascending: true });
 
     if (error) throw error;
-    if (!mensagens.length) return res.status(404).json({ error: 'Sessão não encontrada ou sem mensagens' });
+    if (!mensagens?.length) {
+      return res.status(404).json({ error: 'Sessão não encontrada ou sem mensagens' });
+    }
 
     const textoSessao = mensagens
-      .map(msg => (msg.origem === 'usuario' ? 'Usuário: ' : 'Bot: ') + msg.texto_mensagem)
+      .map((msg) => (msg.origem === 'usuario' ? 'Usuário: ' : 'Bot: ') + msg.texto_mensagem)
       .join('\n');
 
     const listaTagsTema = [
@@ -1132,7 +910,7 @@ app.post('/finalizar-sessao', async (req, res) => {
       'sexualidade e autoaceitacao do prazer',
       'traumas e feridas emocionais',
       'vergonha medo de exposicao e aceitacao social',
-      'vulnerabilidade vergonha e autenticidade',
+      'vulnerabilidade vergonha e autenticidade'
     ];
     const listaTagsRisco = [
       'ideacao_suicida',
@@ -1145,7 +923,7 @@ app.post('/finalizar-sessao', async (req, res) => {
       'ataques_de_panico_recorrentes',
       'crise_psicotica/agitacao_grave',
       'dependencia_quimica_ativa(com_risco_de_vida)',
-      'recusa_total_de_ajuda_diante_de_sofrimento_grave',
+      'recusa_total_de_ajuda_diante_de_sofrimento_grave'
     ];
 
     const prompt = `
@@ -1168,10 +946,10 @@ Retorne APENAS JSON:
       model: 'gpt-4o',
       messages: [
         { role: 'system', content: 'Você é um mentor virtual especialista em psicologia e autoconhecimento.' },
-        { role: 'user', content: prompt },
+        { role: 'user', content: prompt }
       ],
       temperature: 0.2,
-      max_tokens: 600,
+      max_tokens: 600
     });
 
     let conteudo = completion.choices[0].message.content;
@@ -1179,16 +957,21 @@ Retorne APENAS JSON:
 
     const gptResposta = safeParseJSON(conteudo);
     if (!gptResposta) {
-      return res.status(500).json({ error: 'Erro ao interpretar resposta do GPT', resposta_bruta: completion.choices[0].message.content });
+      return res.status(500).json({
+        error: 'Erro ao interpretar resposta do GPT',
+        resposta_bruta: completion.choices[0].message.content
+      });
     }
 
+    // Atualiza a sessão como encerrada (campos da sua tabela)
     const { error: updateError } = await supabase
       .from('sessoes')
       .update({
         resumo: gptResposta.resumo,
-        tags_tema: gptResposta.tags_tema,
-        tags_risco: gptResposta.tags_risco,
-        status: 'fechada',
+        tags_tema: gptResposta.tags_tema || [],
+        tags_risco: gptResposta.tags_risco || [],
+        status: 'encerrada',
+        encerrada_em: new Date().toISOString()
       })
       .eq('id', sessao_id);
 
@@ -1197,7 +980,7 @@ Retorne APENAS JSON:
     // Embedding do resumo
     const emb = await openai.embeddings.create({
       model: 'text-embedding-3-small',
-      input: gptResposta.resumo,
+      input: gptResposta.resumo
     });
     const embedding = emb.data[0].embedding;
 
@@ -1213,8 +996,8 @@ Retorne APENAS JSON:
         user_id: sessaoInfo.user_id,
         sessao_id,
         resumo: gptResposta.resumo,
-        embedding,
-      },
+        embedding
+      }
     ]);
     if (embError) throw embError;
 
@@ -1224,12 +1007,9 @@ Retorne APENAS JSON:
   }
 });
 
-// ---------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------
+/* ========= Server ========= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
-
 
