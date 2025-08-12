@@ -13,24 +13,36 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
 
-// CORS com whitelist (ajuste os domínios do seu front)
-const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:3001')
-  .split(',')
-  .map((s) => s.trim());
+// Para proxies/CDN variarem cache por origem
+app.use((req, res, next) => {
+  res.header('Vary', 'Origin');
+  next();
+});
 
-// Middleware CORS
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true); // Permite requests sem origin (Postman, curl)
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
+// ORIGENS PERMITIDAS (dev + prod)
+const raw = process.env.CORS_ORIGINS
+  || 'http://localhost:3000,http://localhost:5173,https://mentor360-front.onrender.com';
+
+const ALLOWED_ORIGINS = raw.split(',').map(s => s.trim()).filter(Boolean);
+
+// LOG p/ validar no Render
+console.log('[CORS] allowed origins:', ALLOWED_ORIGINS);
+
+app.use(require('cors')({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // curl/Postman
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    console.warn('[CORS] blocked origin:', origin);
+    return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
+  },
+  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: true,
+}));
+
+// Resposta de preflight
+app.options('*', require('cors')());
+
 
 /* ========= Healthcheck ========= */
 app.get('/health', (_req, res) => {
