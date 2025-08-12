@@ -41,8 +41,35 @@ app.use(require('cors')({
 }));
 
 // Resposta de preflight
-app.options('*', require('cors')());
+const corsMiddleware = require('cors')({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    console.warn('[CORS] blocked origin:', origin);
+    return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
+  },
+  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: true,
+});
 
+app.use(corsMiddleware);
+// 🔧 qualquer uma das duas abaixo funciona; escolha UMA:
+app.options('(.*)', corsMiddleware);   // 1) string pattern compatível com v6
+// app.options(/.*/, corsMiddleware);  // 2) regex catch-all (alternativa)
+E mantenha o resto como já está (incluindo o log dos origins):
+
+js
+Copiar
+Editar
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '1mb' }));
+app.use((req, res, next) => { res.header('Vary', 'Origin'); next(); });
+
+const raw = process.env.CORS_ORIGINS
+  || 'http://localhost:3000,http://localhost:5173,https://mentor360-front.onrender.com';
+const ALLOWED_ORIGINS = raw.split(',').map(s => s.trim()).filter(Boolean);
+console.log('[CORS] allowed origins:', ALLOWED_ORIGINS);
 
 /* ========= Healthcheck ========= */
 app.get('/health', (_req, res) => {
