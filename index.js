@@ -13,55 +13,41 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
 
-// Para proxies/CDN variarem cache por origem
+// ajuda caches/proxies a variarem por origem
 app.use((req, res, next) => {
   res.header('Vary', 'Origin');
   next();
 });
 
-// ORIGENS PERMITIDAS (dev + prod)
-const raw = process.env.CORS_ORIGINS
-  || 'http://localhost:3000,http://localhost:5173,https://mentor360-front.onrender.com';
+// ORIGENS PERMITIDAS (dev + prod) — pode sobrescrever via env CORS_ORIGINS
+const raw =
+  process.env.CORS_ORIGINS ||
+  'http://localhost:3000,http://localhost:5173,https://mentor360-front.onrender.com';
 
-const ALLOWED_ORIGINS = raw.split(',').map(s => s.trim()).filter(Boolean);
-
-// LOG p/ validar no Render
+const ALLOWED_ORIGINS = raw.split(',').map((s) => s.trim()).filter(Boolean);
 console.log('[CORS] allowed origins:', ALLOWED_ORIGINS);
 
-app.use(require('cors')({
+// CORS (Express 5 compatível)
+const cors = require('cors');
+const corsMiddleware = cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true); // curl/Postman
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     console.warn('[CORS] blocked origin:', origin);
     return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
   },
-  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-  credentials: true,
-}));
-
-// Resposta de preflight
-const corsMiddleware = require('cors')({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    console.warn('[CORS] blocked origin:', origin);
-    return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
-  },
-  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 });
 
 app.use(corsMiddleware);
+// preflight catch-all (Express 5 usa path-to-regexp v6; '*' quebra)
+app.options('(.*)', corsMiddleware);
+
 // 🔧 qualquer uma das duas abaixo funciona; escolha UMA:
 app.options('(.*)', corsMiddleware);   // 1) string pattern compatível com v6
 // app.options(/.*/, corsMiddleware);  // 2) regex catch-all (alternativa)
-E mantenha o resto como já está (incluindo o log dos origins):
-
-js
-Copiar
-Editar
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => { res.header('Vary', 'Origin'); next(); });
