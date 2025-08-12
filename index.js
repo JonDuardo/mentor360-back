@@ -24,11 +24,10 @@ const raw =
   process.env.CORS_ORIGINS ||
   'http://localhost:3000,http://localhost:5173,https://mentor360-front.onrender.com';
 
-const ALLOWED_ORIGINS = raw.split(',').map((s) => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = raw.split(',').map(s => s.trim()).filter(Boolean);
 console.log('[CORS] allowed origins:', ALLOWED_ORIGINS);
 
-// CORS (Express 5 compatível)
-const cors = require('cors');
+// CORS (compatível com Express 5 / path-to-regexp v6)
 const corsMiddleware = cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true); // curl/Postman
@@ -36,14 +35,15 @@ const corsMiddleware = cors({
     console.warn('[CORS] blocked origin:', origin);
     return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
   },
-  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
   credentials: true,
 });
 
 app.use(corsMiddleware);
-// preflight catch-all (Express 5 usa path-to-regexp v6; '*' quebra)
+// preflight catch-all (não use '*' no Express 5)
 app.options('(.*)', corsMiddleware);
+
 
 // 🔧 qualquer uma das duas abaixo funciona; escolha UMA:
 app.options('(.*)', corsMiddleware);   // 1) string pattern compatível com v6
