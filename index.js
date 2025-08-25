@@ -47,11 +47,33 @@ app.get('/health', (_req, res) => {
 });
 
 /* ========= Supabase & OpenAI ========= */
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY
-);
+const useKey =
+  process.env.SUPABASE_SECRET_KEY               // New API Keys (recomendado)
+  || process.env.SUPABASE_SERVICE_ROLE_KEY      // Legacy service_role (ainda ok)
+  || process.env.SUPABASE_SERVICE_ROLE
+  || process.env.SUPABASE_KEY
+  || process.env.SUPABASE_ANON_KEY;             // último fallback (não fura RLS)
+
+if (!process.env.SUPABASE_URL) {
+  throw new Error('SUPABASE_URL não configurada');
+}
+
+const supabase = createClient(process.env.SUPABASE_URL, useKey);
+
+// Log só para verificar se está usando uma chave que fura RLS
+const usedVarName =
+  process.env.SUPABASE_SECRET_KEY ? 'SUPABASE_SECRET_KEY' :
+  process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SUPABASE_SERVICE_ROLE_KEY' :
+  process.env.SUPABASE_SERVICE_ROLE ? 'SUPABASE_SERVICE_ROLE' :
+  process.env.SUPABASE_KEY ? 'SUPABASE_KEY' :
+  process.env.SUPABASE_ANON_KEY ? 'SUPABASE_ANON_KEY' :
+  'nenhuma';
+
+console.log('[SUPABASE] var usada:', usedVarName, '| RLS bypass?',
+  /SECRET_KEY|SERVICE_ROLE/.test(usedVarName) ? 'SIM' : 'NÃO');
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 
 // opcional: deixar o client no req
 app.use((req, _res, next) => { req.supabase = supabase; next(); });
@@ -856,6 +878,90 @@ app.post('/finalizar-sessao', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+/* ========= Feedback de sessão (logo após rotas de /sessoes) ========= */
+app.post('/feedback/sessao', async (req, res) => {
+  try {
+    const {
+      user_id,
+      sessao_id,
+      ambiente,                 // 'beta' | 'prod'
+      nota_tom_rapport,         // 1..10
+      nota_memoria,             // 1..10
+      nps,                      // 0..10
+      atingiu_objetivo,         // boolean
+      sugestao,                 // texto opcional
+      modelo_ai,
+      versao_app,
+      motivo_gatilho,           // ex: 'intervalo_sessoes'
+    } = req.body || {};
+
+    if (!user_id || !sessao_id) {
+      return res.status(400).json({ erro: 'user_id e sessao_id são obrigatórios.' });
+    }
+    if (!['beta', 'prod'].includes(String(ambiente || '').toLowerCase())) {
+      return res.status(400).json({ erro: "ambiente deve ser 'beta' ou 'prod'." });
+    }
+
+    const toInt = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+    const inRangeInt = (v, min, max) => {
+      if (v === null) return null;
+      if (!Number.isInteger(v) || v < min || v > max) return NaN;
+      return v;
+    };
+
+    const _notaTom = inRangeInt(toInt(nota_tom_rapport), 1, 10);
+    const _notaMem = inRangeInt(toInt(nota_memoria), 1, 10);
+    const _nps     = inRangeInt(toInt(nps), 0, 10);
+
+    if (Number.isNaN(_notaTom)) return res.status(400).json({ erro: 'nota_tom_rapport deve ser inteiro 1..10.' });
+    if (Number.isNaN(_notaMem)) return res.status(400).json({ erro: 'nota_memoria deve ser inteiro 1..10.' });
+    if (Number.isNaN(_nps))     return res.status(400).json({ erro: 'nps deve ser inteiro 0..10.' });
+
+    const _atingiu  = typeof atingiu_objetivo === 'boolean' ? atingiu_objetivo : null;
+    const _sugestao = (sugestao || '').toString().trim().slice(0, 4000);
+
+    // Verifica se a sessão pertence ao usuário
+    const { data: sess, error: errSess } = await supabase
+      .from('sessoes')
+      .select('id, user_id')
+      .eq('id', sessao_id)
+      .single();
+
+    if (errSess || !sess) return res.status(400).json({ erro: 'Sessão não encontrada.' });
+    if (sess.user_id !== user_id) return res.status(403).json({ erro: 'Sessão não pertence ao usuário.' });
+
+    // Upsert respeitando unique (user_id, sessao_id)
+    const payload = {
+      user_id,
+      sessao_id,
+      ambiente: String(ambiente).toLowerCase(),
+      nota_tom_rapport: _notaTom,
+      nota_memoria: _notaMem,
+      nps: _nps,
+      atingiu_objetivo: _atingiu,
+      sugestao: _sugestao || null,
+      modelo_ai: modelo_ai || null,
+      versao_app: versao_app || null,
+      motivo_gatilho: motivo_gatilho || 'intervalo_sessoes',
+      concluida_em: new Date().toISOString(),
+    };
+
+    const { data: upserted, error: errUp } = await supabase
+      .from('sessao_feedback')
+      .upsert(payload, { onConflict: 'user_id,sessao_id' })
+      .select('id, user_id, sessao_id, nps, nota_tom_rapport, nota_memoria, created_at')
+      .single();
+
+    if (errUp) return res.status(400).json({ erro: 'Não foi possível salvar feedback.', detalhe: errUp.message });
+
+    return res.json({ ok: true, feedback: upserted });
+  } catch (e) {
+    console.error('[POST /feedback/sessao] ERRO:', e);
+    return res.status(500).json({ erro: 'Falha interna ao salvar feedback.' });
+  }
+});
+/* ========= Fim feedback de sessão ========= */
 
 /* ========= Server ========= */
 const PORT = process.env.PORT || 3001; // 3001 local para não brigar com o front
