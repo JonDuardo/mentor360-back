@@ -58,14 +58,33 @@ const ALLOWED_ORIGINS = String(
   .map(s => s.trim())
   .filter(Boolean);
 
-console.log('[CORS] allowed origins:', ALLOWED_ORIGINS);
+const EXTRA_ORIGINS = String(process.env.CORS_EXTRA_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+console.log('[CORS] allowed origins:', ALLOWED_ORIGINS, 'extra:', EXTRA_ORIGINS);
+
+function isRenderPreview(origin) {
+  try {
+    const url = new URL(origin);
+    const host = url.hostname.toLowerCase();
+    return origin.startsWith('https://') && host.endsWith('.onrender.com') && host.includes('-pr-');
+  } catch (_) {
+    return false;
+  }
+}
 
 // config dinâmica por origem
 const corsOptions = {
   origin(origin, cb) {
     // requisições sem Origin (curl/health) passam
     if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    if (
+      ALLOWED_ORIGINS.includes(origin) ||
+      EXTRA_ORIGINS.includes(origin) ||
+      isRenderPreview(origin)
+    ) return cb(null, true);
     console.warn('[CORS] blocked origin:', origin);
     return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
   },
@@ -94,7 +113,7 @@ app.use((req, res, next) => {
 
 /* ========= Health ========= */
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString() });
+  res.status(200).json({ status: 'ok' });
 });
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString(), flags: FLAGS });
