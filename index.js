@@ -1,7 +1,6 @@
 ﻿require('dotenv').config();
 
 const express = require('express');
-const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
@@ -11,6 +10,26 @@ const { buscarConteudoBasePorTags } = require('./conteudo_utils');
 const crypto = require('crypto');
 
 const app = express();
+
+const corsCsv = process.env.CORS_ORIGINS || '';
+const allowedOrigins = corsCsv.split(',').map(s => s.trim()).filter(Boolean);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
+
+console.log('[CORS] allowed origins:', allowedOrigins);
 
 /* ========= Env & Flags ========= */
 const FLAGS = {
@@ -41,48 +60,12 @@ const LOGCFG = {
 let __debug_until = LOGCFG.DEBUG_ENABLED_BOOT ? Date.now() + LOGCFG.DEBUG_TTL_MIN * 60_000 : 0;
 const isGlobalDebugActive = () => __debug_until && Date.now() < __debug_until;
 
-// ===== CORS robusto (inclui preflight/OPTIONS) =====
-
 // confia em proxy (Render, Vercel, etc.)
 app.set('trust proxy', 1);
 
+// substituído por middleware de CORS por origem (acima)
 // body parser (⚠️ necessário para POST/PUT/PATCH)
 app.use(express.json({ limit: LIMITS.BODY_LIMIT }));
-
-// origens permitidas (env > default)
-const ALLOWED_ORIGINS = String(
-  process.env.CORS_ORIGINS ||
-  'http://localhost:3000,http://localhost:5173,https://mentor360-front.onrender.com'
-)
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-console.log('[CORS] allowed origins:', ALLOWED_ORIGINS);
-
-// config dinâmica por origem
-const corsOptions = {
-  origin(origin, cb) {
-    // requisições sem Origin (curl/health) passam
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    console.warn('[CORS] blocked origin:', origin);
-    return cb(new Error(`Origin ${origin} não permitido pelo CORS`));
-  },
-  methods: ['GET','HEAD','PUT','PATCH','POST','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','X-Requested-With','Accept','x-admin-token'],
-  credentials: false,           // não usamos cookies cross-site
-  maxAge: 600,                  // 10min de cache do preflight
-  optionsSuccessStatus: 204,
-};
-
-// aplica CORS e preflight (Express 5 exige regex, não '*')
-app.use(cors(corsOptions));
-app.options(/.*/, cors(corsOptions));
-
-// ajuda proxies/caches a variar por Origin
-app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
-
 
 /* ========= RequestId + startTime ========= */
 app.use((req, res, next) => {
